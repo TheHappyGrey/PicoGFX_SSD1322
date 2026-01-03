@@ -1,0 +1,5 @@
+# Syntax: keyword   KEYWORD1 (for types/classes) or KEYWORD2 (for functions)
+PicoGFX_SSD1322	KEYWORD1
+display	KEYWORD2
+displayBlocking	KEYWORD2
+isTransferComplete	KEYWORD2
