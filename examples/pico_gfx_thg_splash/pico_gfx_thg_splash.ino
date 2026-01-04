@@ -22,13 +22,11 @@ void setup() {
     while (1); // Halt
   }
 
-  // Optional: Set a nice contrast
   display.setContrast(0xFF); // Full contrast (adjust 0x00–0xFF as needed)
 
   // Clear both buffers to black
   display.clearDisplay();
 
-  // Optional: Set a callback so we know when a frame is fully sent
   display.setDisplayCompleteCallback([] {
     Serial.println("Splash image fully transferred to display!");
   });
@@ -48,8 +46,6 @@ void loop() {
     // - Start drawing the next frame (e.g., animation)
     // - Update sensors, UI, etc.
     // - Call display.display() again when ready
-
-    // For a simple static splash, we can just wait a bit and keep it on screen
     delay(10); // Small delay to avoid busy-looping at 100%
   }
   // If transfer is still in progress, loop() continues immediately
