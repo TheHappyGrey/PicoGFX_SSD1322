@@ -250,6 +250,10 @@ Add Doxygen-style comments
 Follow the Code of Conduct
 See Adafruit Doxygen guides: https://learn.adafruit.com/the-well-automated-arduino-library/doxygen
 
+## 4bpp Bitmap Converter
+Use [4bittrix](https://github.com/TheHappyGrey/4bittrix) to easily convert images to 4bpp .h files for `draw4bppBitmap()`.
+- Download the Windows EXE from releases.
+
 Changelog
 See Changelog.md
 Support
