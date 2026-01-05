@@ -63,6 +63,10 @@ BSD 3-Clause License. See `LICENSE.md` for details. The original Adafruit SSD132
 
 ### Install the Library
 
+Option 1: 
+Install in Adruino IDE via library manager. 
+
+Option2:
 1. Download or clone this repository: https://github.com/TheHappyGrey/PicoGFX_SSD1322
 2. In Arduino IDE: **Sketch → Include Library → Add .ZIP Library…** and select the downloaded ZIP  
    OR place the folder in your Arduino libraries directory
