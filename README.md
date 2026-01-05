@@ -98,6 +98,7 @@ Examples will appear under **File → Examples → PicoGFX_SSD1322**
 
 ## Usage
 
+```cpp
 #include <PicoGFX_SSD1322.h>
 #include <Adafruit_GFX.h>
 
@@ -105,43 +106,56 @@ Constructors
 Hardware SPI (Recommended)
 
 PicoGFX_SSD1322 display(256, 64, &SPI, DC_PIN, RST_PIN, CS_PIN, bitrate);
+```
+### Example:
 
-Example:
-
+```cpp
 PicoGFX_SSD1322 display(256, 64, &SPI, 8, 10, 9);  // Default 8 MHz; up to 16 MHz possible
+```
+### Software SPI
 
-Software SPI
-
+```cpp
 PicoGFX_SSD1322 display(256, 64, MOSI_PIN, SCLK_PIN, DC_PIN, RST_PIN, CS_PIN);
+```
+### I2C
 
-I2C
-
+```cpp
 PicoGFX_SSD1322 display(256, 64, &Wire, RST_PIN);
+```
+### Initialization
 
-Initialization
-
+```cpp
 void setup() {
   if (!display.begin()) {
     Serial.println("Display init failed!");
     while (1);
   }
 }
-
-Key Methods
+```
+### Key Methods
 
 display() – Starts non-blocking DMA transfer (SPI) or blocking update (I2C)
 displayBlocking() – Waits until update completes
+
 isTransferComplete() – Returns true when DMA transfer is finished
+
 setDisplayCompleteCallback(callback) – Execute function when update completes
+
 invertDisplay(bool i) – Invert colors
+
 displayOn() / displayOff() – Power control
+
 allPixelOn() / allPixelOff() – All pixels full bright / off
+
 setContrast(uint8_t level) – 0–255
+
 draw4bppBitmap(x, y, bitmap, w, h) – Draw grayscale bitmap (PROGMEM or RAM)
+
 getFont() – Returns current GFX font
 
-Full Example Sketch
+### Full Example Sketch
 
+```cpp
 #include <PicoGFX_SSD1322.h>
 #include <Adafruit_GFX.h>
 #include "splash.h"  // Optional: included sample bitmap
@@ -194,9 +208,10 @@ void loop() {
   rot = (rot + 1) % 4;
   delay(2000);
 }
+```
+### Asynchronous Example with Callback
 
-Asynchronous Example with Callback
-
+```cpp
 void onDisplayDone() {
   Serial.println("Display update complete!");
   digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));  // Blink LED
@@ -219,22 +234,24 @@ void loop() {
 
   frame++;
 }
+```
+### Drawing a PROGMEM Bitmap
 
-Drawing a PROGMEM Bitmap
-
+```cpp
 #include "mybitmap.h"  // Your converted 4bpp bitmap
 
 display.draw4bppBitmap(0, 0, myBitmap, 256, 64);
 display.displayBlocking();
+```
 
-Troubleshooting
+### Troubleshooting
 
 Init fails → Check wiring, 3.3V power, pin definitions, and that the Arduino-Pico core is installed
 DMA not working → Confirm you're using hardware SPI and the official Philhower core
 Screen tearing/flickering → Always wait for isTransferComplete() or use displayBlocking()
 Compilation errors on non-Pico boards → This library is intentionally Pico-specific
 
-Limitations
+### Limitations
 
 Requires Arduino-Pico core for full functionality
 ~16 KB SRAM needed for double buffer
@@ -242,7 +259,7 @@ Only 4-wire SPI and I2C tested
 SPI commands (not data) and all I2C operations are blocking
 Long-term OLED use may cause pixel dimming — call displayOff() when idle to extend life
 
-Contributing
+### Contributing
 Contributions are welcome!
 
 Format code with clang-format
@@ -254,7 +271,7 @@ See Adafruit Doxygen guides: https://learn.adafruit.com/the-well-automated-ardui
 Use [4bittrix](https://github.com/TheHappyGrey/4bittrix) to easily convert images to 4bpp .h files for `draw4bppBitmap()`.
 - Download the Windows EXE from releases.
 
-Changelog
+### Changelog
 See Changelog.md
 Support
 Open an issue: https://github.com/TheHappyGrey/PicoGFX_SSD1322/issues
