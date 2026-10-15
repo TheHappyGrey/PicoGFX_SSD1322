@@ -36,6 +36,9 @@ You will find the original Library here https://github.com/adafruit/Adafruit_SSD
 #include "PicoGFX_SSD1322.h"
 #include "splash.h"
 #include <SPI.h>
+#include <new>
+#include <stdlib.h>
+#include <string.h>
 
 
 // CONSTRUCTORS, DESTRUCTOR ------------------------------------------------
@@ -164,7 +167,10 @@ PicoGFX_SSD1322::PicoGFX_SSD1322(uint16_t w, uint16_t h, SPIClass *spi,
 PicoGFX_SSD1322::~PicoGFX_SSD1322(void) {
     delete[] bufferA;
     delete[] bufferB;
-    bufferA = bufferB = nullptr;
+    bufferA = bufferB = drawBuffer = displayBuffer = nullptr;
+    // The base class frees `buffer` with free(). It points at one of the two above, which have
+    // just gone and were never malloc'd in the first place, so leave nothing for it to find.
+    this->buffer = nullptr;
 }
 
 // ALLOCATE & INIT DISPLAY -------------------------------------------------
@@ -194,14 +200,16 @@ bool PicoGFX_SSD1322::begin(uint8_t addr, bool reset) {
     return false;
   }
 
-  // FREE the buffer that the base class allocated – we don't want it
-  delete[] buffer;
-  buffer = nullptr;  // Prevent base class from deleting it later
+  // Release the buffer the base class allocated - we keep our own pair instead. It came from
+  // malloc() in Adafruit_GrayOLED::_init(), so it has to go back with free(); delete[] on it is
+  // undefined behaviour even where it happens to work.
+  free(buffer);
+  buffer = nullptr;
 
-  uint16_t buffer_size = WIDTH * HEIGHT / 2;  // 4 bits per pixel
+  const size_t buffer_size = (size_t)WIDTH * HEIGHT / 2;  // 4 bits per pixel
 
-  bufferA = new uint8_t[buffer_size];
-  bufferB = new uint8_t[buffer_size];
+  bufferA = new (std::nothrow) uint8_t[buffer_size];
+  bufferB = new (std::nothrow) uint8_t[buffer_size];
 
   if (!bufferA || !bufferB) {
     delete[] bufferA;
@@ -214,7 +222,11 @@ bool PicoGFX_SSD1322::begin(uint8_t addr, bool reset) {
   memset(bufferB, SSD1322_BLACK, buffer_size);
 
   drawBuffer = bufferA;     // Start drawing into bufferA
-  displayBuffer = bufferB;  // First display() will send bufferB (initially black – safe)
+  displayBuffer = bufferB;  // ... and bufferB is what the swap in display() will send first
+
+  transferInProgress = false;
+  transfer_rows_per_chunk = 1;
+  bytes_per_row = WIDTH / 2;
 
   // IMPORTANT: Make base class use our draw buffer
   this->buffer = drawBuffer;
@@ -267,97 +279,143 @@ bool PicoGFX_SSD1322::begin(uint8_t addr, bool reset) {
 /*!
     @brief  Do the actual writing of the internal frame buffer to display RAM using DMA for SPI
 */
-void PicoGFX_SSD1322::display(void) {
+bool PicoGFX_SSD1322::displayAsync(void) {
   yield();
 
-  // Calculate dirty region
-  int16_t first_row = max(0, window_y1);
-  int16_t last_row = min(HEIGHT - 1, window_y2);
-  int16_t byte_start = window_x1 / 2;  // Integer division for byte index
-  int16_t byte_end = window_x2 / 2;    // Integer division for byte index
-  uint8_t column_start = 28 + (byte_start / 2);  // Map byte index to column
-  uint8_t column_end = 28 + (byte_end / 2);      // Map byte index to column
-  transfer_byte_start = (column_start - 28) * 2; // Starting byte offset
-  transfer_bytes_per_row = (column_end - column_start + 1) * 2; // Bytes per row
+  // A transfer already running owns displayBuffer. Swapping the buffers under it would hand the
+  // caller the one being sent to draw into, and send the one they were drawing - so this test
+  // has to come before anything is touched, not after the swap.
+  if (transferInProgress) {
+    checkTransferComplete();
+    if (transferInProgress) return false;
+  }
 
-  // Swap: what we were drawing into becomes the one to display
+  // Clamp the dirty region into the panel, and take an empty one for what it is: nothing was
+  // drawn since the last update, so there is nothing to send. Clamping the other way - letting
+  // window_y1 of HEIGHT through as a first row of HEIGHT - produced an inverted row range, a
+  // byte count that underflowed to 130, and a transfer that read past the end of the buffer.
+  if (window_x2 < window_x1 || window_y2 < window_y1) return false;
+  int16_t first_row = window_y1 < 0 ? 0 : window_y1;
+  int16_t last_row = window_y2 > (int16_t)(HEIGHT - 1) ? (int16_t)(HEIGHT - 1) : window_y2;
+  int16_t first_px = window_x1 < 0 ? 0 : window_x1;
+  int16_t last_px = window_x2 > (int16_t)(WIDTH - 1) ? (int16_t)(WIDTH - 1) : window_x2;
+  if (last_row < first_row || last_px < first_px) return false;
+
+  // The controller addresses four pixels (two bytes) at a time, so widen to those boundaries.
+  const uint8_t column_start = (uint8_t)(28 + (first_px / 4));
+  const uint8_t column_end = (uint8_t)(28 + (last_px / 4));
+  transfer_byte_start = (int16_t)((column_start - 28) * 2);
+  transfer_bytes_per_row = (uint8_t)((column_end - column_start + 1) * 2);
+  this->bytes_per_row = WIDTH / 2;
+  current_row = first_row;
+  this->last_row = last_row;
+
+  // Swap: what we were drawing into becomes the one to display.
   uint8_t* temp = drawBuffer;
   drawBuffer = displayBuffer;
   displayBuffer = temp;
-
-  // Update base class pointer so drawing calls go to the new draw buffer
   this->buffer = drawBuffer;
 
-  if (i2c_dev) { // I2C case
-    i2c_dev->setSpeed(i2c_preclk);
-    uint8_t maxbuff = i2c_dev->maxBufferSize() - 1;
+  // The region is captured now, so the next frame starts with a clean window. Clearing it when
+  // the transfer finishes instead would throw away whatever the caller drew in the meantime -
+  // which is precisely what double buffering is for.
+  window_x1 = WIDTH;
+  window_y1 = HEIGHT;
+  window_x2 = -1;
+  window_y2 = -1;
 
-    oled_command(SSD1322_SETROW);       // 0x75
-    oled_data(first_row);               // Row start
-    oled_data(last_row);                // Row end
-    oled_command(SSD1322_SETCOLUMN);    // 0x15
-    oled_data(column_start);            // Column start
-    oled_data(column_end);              // Column end
-    oled_command(SSD1322_ENWRITEDATA);  // 0x5C
+  openWindow(column_start, column_end, first_row, last_row);
 
-    uint8_t *ptr = displayBuffer + first_row * (WIDTH / 2) + transfer_byte_start;
-    uint8_t dc_byte = 0x40;
-
-    for (uint8_t row = first_row; row <= last_row; row++) {
-      uint8_t bytes_remaining = transfer_bytes_per_row;
-      while (bytes_remaining) {
-        uint8_t to_write = min(bytes_remaining, maxbuff);
-        i2c_dev->write(ptr, to_write, true, &dc_byte, 1);
-        ptr += to_write;
-        bytes_remaining -= to_write;
-        yield();
-      }
-      ptr += (WIDTH / 2) - transfer_bytes_per_row; // Move to next row
-    }
-    i2c_dev->setSpeed(i2c_postclk);
-
-    // Reset dirty region for I2C (blocking)
-    window_x1 = WIDTH;
-    window_y1 = HEIGHT;
-    window_x2 = -1;
-    window_y2 = -1;
-
-    // Call callback if set
-    if (completeCallback) {
-      completeCallback();
-    }
-  } else { // SPI with DMA
-    // Prevent starting a new transfer if one is already in progress
-    if (transferInProgress) {
-      return; // Ignore new transfer request
-    }
-
-    // Send commands (blocking) using existing methods
-    oled_command(SSD1322_SETROW);       // 0x75
-    oled_data(first_row);               // Row start
-    oled_data(last_row);                // Row end
-    oled_command(SSD1322_SETCOLUMN);    // 0x15
-    oled_data(column_start);            // Column start
-    oled_data(column_end);              // Column end
-    oled_command(SSD1322_ENWRITEDATA);  // 0x5C
-
-    // Set state variables for DMA transfers
-    current_row = first_row;
-    this->last_row = last_row;
-    this->bytes_per_row = WIDTH / 2;
-
-    // Calculate pointer for the first row of the display buffer
-    uint8_t *ptr = displayBuffer + first_row * bytes_per_row + transfer_byte_start;
-
-    // Manually assert CS# low and set DC# high for data mode
-    digitalWrite(csPin, LOW);
-    digitalWrite(dcPin, HIGH);
-
-    // Start the first async DMA transfer
-    currentInstance = this;
-    static_cast<SPIClassRP2040*>(this->spi)->transferAsync(ptr, nullptr, transfer_bytes_per_row);
-    transferInProgress = true;
+  // I2C and software SPI have no DMA path; both send and return done.
+  if (i2c_dev || !spi) {
+    sendBlocking(first_row, last_row);
+    syncDrawBuffer();
+    if (completeCallback) completeCallback();
+    return true;
   }
+
+  // Where the region spans the full width its rows are one unbroken run of bytes, so the whole
+  // update goes in a single DMA instead of one per row.
+  transfer_rows_per_chunk =
+      (transfer_bytes_per_row == bytes_per_row) ? (uint8_t)(last_row - first_row + 1) : 1;
+
+  uint8_t *ptr = displayBuffer + (size_t)first_row * bytes_per_row + transfer_byte_start;
+
+  // CS stays low for the whole multi-row transfer; DC high selects data.
+  digitalWrite(csPin, LOW);
+  digitalWrite(dcPin, HIGH);
+
+  currentInstance = this;
+  const size_t bytes = (size_t)transfer_bytes_per_row * transfer_rows_per_chunk;
+  if (!static_cast<SPIClassRP2040*>(this->spi)->transferAsync(ptr, nullptr, bytes)) {
+    // No DMA channel was free. Say so rather than leaving CS low and a transfer that never ran
+    // looking, to finishedAsync(), exactly like one that completed.
+    digitalWrite(csPin, HIGH);
+    currentInstance = nullptr;
+    return false;
+  }
+  transferInProgress = true;
+
+  // Bring the buffer we are about to draw into up to date with the one now on its way to the
+  // panel. Without this it still holds the frame before that, so anything drawn next that does
+  // not cover the whole dirty rectangle lets two-frames-old pixels through. Both buffers are
+  // only read here, so it is safe to do while the DMA streams.
+  syncDrawBuffer();
+  return true;
+}
+
+/*!
+    @brief  Send everything drawn since the last update. Adafruit_GrayOLED requires this to return
+            nothing; displayAsync() is the same call with its result.
+*/
+void PicoGFX_SSD1322::display(void) { (void)displayAsync(); }
+
+/*!
+    @brief  Point the controller's write window at the dirty region and open it for data.
+*/
+void PicoGFX_SSD1322::openWindow(uint8_t column_start, uint8_t column_end, int16_t first_row,
+                                 int16_t last_row) {
+  if (i2c_dev) i2c_dev->setSpeed(i2c_preclk);
+  oled_command(SSD1322_SETROW);       // 0x75
+  oled_data((uint8_t)first_row);
+  oled_data((uint8_t)last_row);
+  oled_command(SSD1322_SETCOLUMN);    // 0x15
+  oled_data(column_start);
+  oled_data(column_end);
+  oled_command(SSD1322_ENWRITEDATA);  // 0x5C
+}
+
+/*!
+    @brief  Send the dirty region and wait for it. Used by I2C and by software SPI.
+*/
+void PicoGFX_SSD1322::sendBlocking(int16_t first_row, int16_t last_row) {
+  const uint8_t maxbuff = i2c_dev ? (uint8_t)(i2c_dev->maxBufferSize() - 1) : transfer_bytes_per_row;
+  uint8_t dc_byte = 0x40;
+
+  for (int16_t row = first_row; row <= last_row; row++) {
+    uint8_t *ptr = displayBuffer + (size_t)row * bytes_per_row + transfer_byte_start;
+    uint8_t bytes_remaining = transfer_bytes_per_row;
+    while (bytes_remaining) {
+      const uint8_t to_write = min(bytes_remaining, maxbuff);
+      if (i2c_dev) {
+        i2c_dev->write(ptr, to_write, true, &dc_byte, 1);
+      } else {
+        digitalWrite(dcPin, HIGH);
+        spi_dev->write(ptr, to_write);
+      }
+      ptr += to_write;
+      bytes_remaining -= to_write;
+      yield();
+    }
+  }
+  if (i2c_dev) i2c_dev->setSpeed(i2c_postclk);
+}
+
+/*!
+    @brief  Copy the frame just sent into the buffer the caller will draw next.
+*/
+void PicoGFX_SSD1322::syncDrawBuffer(void) {
+  if (drawBuffer && displayBuffer) memcpy(drawBuffer, displayBuffer, (size_t)WIDTH * HEIGHT / 2);
 }
 
 /*!
@@ -365,35 +423,27 @@ void PicoGFX_SSD1322::display(void) {
     @return true if a transfer was completed, false if still in progress
 */
 bool PicoGFX_SSD1322::checkTransferComplete() {
-  if (!transferInProgress || !static_cast<SPIClassRP2040*>(this->spi)->finishedAsync()) {
-    return false;
-  }
+  if (!transferInProgress || !spi) return false;
+  if (!static_cast<SPIClassRP2040*>(this->spi)->finishedAsync()) return false;
 
-  current_row++;
+  current_row += transfer_rows_per_chunk;
   if (current_row <= last_row) {
-    // Calculate buffer pointer for the next row using displayBuffer
-    uint8_t *ptr = displayBuffer + current_row * bytes_per_row + transfer_byte_start;
-    // Initiate the next async DMA transfer
-    static_cast<SPIClassRP2040*>(this->spi)->transferAsync(ptr, nullptr, transfer_bytes_per_row);
-    return false;
-  } else {
-    // All rows have been sent; deassert CS# high
-    digitalWrite(csPin, HIGH);
-
-    // Reset dirty rectangle ONLY when transfer fully complete
-    window_x1 = WIDTH;
-    window_y1 = HEIGHT;
-    window_x2 = -1;
-    window_y2 = -1;
-
-    transferInProgress = false;
-    currentInstance = nullptr;
-
-    if (completeCallback) {
-      completeCallback();
-    }
-    return true;
+    uint8_t *ptr = displayBuffer + (size_t)current_row * bytes_per_row + transfer_byte_start;
+    const size_t bytes = (size_t)transfer_bytes_per_row * transfer_rows_per_chunk;
+    if (static_cast<SPIClassRP2040*>(this->spi)->transferAsync(ptr, nullptr, bytes)) return false;
+    // Out of DMA channels part way through. Finish here rather than spin: the rest of the frame
+    // is missing, but the bus is released and the next display() can draw it again.
   }
+
+  // Done (or given up): release the bus.
+  digitalWrite(csPin, HIGH);
+  transferInProgress = false;
+  currentInstance = nullptr;
+
+  // The dirty window is NOT cleared here. display() cleared it when it captured this region,
+  // so anything drawn while the transfer was in flight is still recorded and will be sent next.
+  if (completeCallback) completeCallback();
+  return true;
 }
 
 /*!
@@ -418,7 +468,7 @@ void PicoGFX_SSD1322::handleTransferComplete() {
     @brief  Blocking version of display() – waits until transfer is fully complete
 */
 void PicoGFX_SSD1322::displayBlocking() {
-  display();  // Start non-blocking transfer
+  displayAsync();  // Start non-blocking transfer
   while (!isTransferComplete()) {
     yield();  // Allow other tasks to run
   }
@@ -497,93 +547,84 @@ GFXfont * PicoGFX_SSD1322::getFont(void) {
 }
 
 /*!
-    @brief  Draw a PROGMEM-resident 4bpp bitmap to the internal buffer
-    @param  x       X-coordinate of top-left corner on display
-    @param  y       Y-coordinate of top-left corner on display
-    @param  bitmap  Pointer to PROGMEM bitmap array (4 bits per pixel, two pixels per byte)
-    @param  w       Bitmap width in pixels
-    @param  h       Bitmap height in pixels
-    @note   Updates internal buffer; call display() to show on OLED
+    @brief  Draw a 4bpp bitmap into the frame buffer.
+    @param  x        X-coordinate of top-left corner on display
+    @param  y        Y-coordinate of top-left corner on display
+    @param  bitmap   4 bits per pixel, two pixels per byte, high nibble is the left pixel
+    @param  w        Bitmap width in pixels
+    @param  h        Bitmap height in pixels
+    @param  progmem  True to read the bitmap through pgm_read_byte
+    @note   Updates the frame buffer; call display() to show it.
+
+    Where the bitmap lands on a byte boundary and the panel is unrotated, its bytes already match
+    the buffer's layout two pixels at a time, so whole rows are copied straight in. That is the
+    common case for art produced by a 4bpp converter, and it replaces two bounds-checked virtual
+    drawPixel() calls per byte with one memcpy per row. Anything else - an odd x, an odd width, a
+    rotated panel, a bitmap hanging off the edge - takes the per-pixel path, which is unchanged.
 */
-void PicoGFX_SSD1322::draw4bppBitmap(int16_t x, int16_t y, const uint8_t *bitmap, uint16_t w, uint16_t h) {
-    if (w <= 0 || h <= 0) return;
+void PicoGFX_SSD1322::drawBitmap4bpp(int16_t x, int16_t y, const uint8_t *bitmap, uint16_t w,
+                                     uint16_t h, bool progmem) {
+    if (!bitmap || w == 0 || h == 0 || !buffer) return;
 
-    // Update dirty rect
-    window_x1 = min(window_x1, x);
-    window_y1 = min(window_y1, y);
-    window_x2 = max(window_x2, x + w - 1);
-    window_y2 = max(window_y2, y + h - 1);
+    const int16_t x2 = (int16_t)(x + w - 1);
+    const int16_t y2 = (int16_t)(y + h - 1);
+    if (x2 < 0 || x >= (int16_t)WIDTH || y2 < 0 || y >= (int16_t)HEIGHT) return;  // fully off-panel
 
-    int16_t x2 = x + w - 1;
-    int16_t y2 = y + h - 1;
-    if (x2 < 0 || x >= WIDTH || y2 < 0 || y >= HEIGHT) return;
+    // Mark only the part that actually lands on the panel. Marking the whole bitmap, as this used
+    // to, lets a sprite that is mostly off-screen drag the dirty rectangle out past the edge and
+    // cost a far larger transfer than it needs to.
+    const int16_t cx1 = x < 0 ? 0 : x;
+    const int16_t cy1 = y < 0 ? 0 : y;
+    const int16_t cx2 = x2 > (int16_t)(WIDTH - 1) ? (int16_t)(WIDTH - 1) : x2;
+    const int16_t cy2 = y2 > (int16_t)(HEIGHT - 1) ? (int16_t)(HEIGHT - 1) : y2;
+    window_x1 = min(window_x1, cx1);
+    window_y1 = min(window_y1, cy1);
+    window_x2 = max(window_x2, cx2);
+    window_y2 = max(window_y2, cy2);
 
-    for (int16_t jy = 0; jy < h; jy++) {
-        int16_t py = y + jy;
-        if (py < 0 || py >= HEIGHT) continue;
+    const bool aligned = (getRotation() == 0) && ((x & 1) == 0) && ((w & 1) == 0) &&
+                         (x >= 0) && (x2 < (int16_t)WIDTH);
+    const uint16_t srcStride = (uint16_t)(w / 2);
 
-        for (int16_t ix = 0; ix < w; ix += 2) {  // Process 2 pixels per byte
-            uint16_t byteIndex = (jy * w + ix) / 2;
-            uint8_t data = pgm_read_byte(&bitmap[byteIndex]);
-
-            uint8_t pixel1 = (data >> 4) & 0x0F;
-            uint8_t pixel2 = data & 0x0F;
-
-            int16_t px1 = x + ix;
-            int16_t px2 = x + ix + 1;
-
-            if (px1 >= 0 && px1 < WIDTH) {
-                drawPixel(px1, py, pixel1);
+    if (aligned) {
+        for (uint16_t jy = 0; jy < h; jy++) {
+            const int16_t py = (int16_t)(y + jy);
+            if (py < 0 || py >= (int16_t)HEIGHT) continue;
+            uint8_t *dst = buffer + (size_t)py * (WIDTH / 2) + (x / 2);
+            const uint8_t *src = bitmap + (size_t)jy * srcStride;
+            if (progmem) {
+                memcpy_P(dst, src, srcStride);
+            } else {
+                memcpy(dst, src, srcStride);
             }
-            if (ix + 1 < w && px2 >= 0 && px2 < WIDTH) {
-                drawPixel(px2, py, pixel2);
-            }
+        }
+        return;
+    }
+
+    for (uint16_t jy = 0; jy < h; jy++) {
+        const int16_t py = (int16_t)(y + jy);
+        if (py < 0 || py >= (int16_t)HEIGHT) continue;
+        for (uint16_t ix = 0; ix < w; ix += 2) {
+            const size_t byteIndex = (size_t)jy * srcStride + (ix / 2);
+            const uint8_t data = progmem ? pgm_read_byte(&bitmap[byteIndex]) : bitmap[byteIndex];
+            const int16_t px1 = (int16_t)(x + ix);
+            const int16_t px2 = (int16_t)(x + ix + 1);
+            if (px1 >= 0 && px1 < (int16_t)WIDTH) drawPixel(px1, py, (data >> 4) & 0x0F);
+            if (ix + 1 < w && px2 >= 0 && px2 < (int16_t)WIDTH) drawPixel(px2, py, data & 0x0F);
         }
     }
 }
 
 /*!
-    @brief  Draw a RAM-resident 4bpp bitmap to the internal buffer
-    @param  x       X-coordinate of top-left corner on display
-    @param  y       Y-coordinate of top-left corner on display
-    @param  bitmap  Pointer to RAM bitmap array (4 bits per pixel, two pixels per byte)
-    @param  w       Bitmap width in pixels
-    @param  h       Bitmap height in pixels
-    @note   Updates internal buffer; call display() to show on OLED
+    @brief  Draw a PROGMEM-resident 4bpp bitmap. See drawBitmap4bpp().
+*/
+void PicoGFX_SSD1322::draw4bppBitmap(int16_t x, int16_t y, const uint8_t *bitmap, uint16_t w, uint16_t h) {
+    drawBitmap4bpp(x, y, bitmap, w, h, true);
+}
+
+/*!
+    @brief  Draw a RAM-resident 4bpp bitmap. See drawBitmap4bpp().
 */
 void PicoGFX_SSD1322::draw4bppBitmap(int16_t x, int16_t y, uint8_t *bitmap, uint16_t w, uint16_t h) {
-    if (w <= 0 || h <= 0) return;
-
-    // Update dirty region
-    window_x1 = min(window_x1, x);
-    window_y1 = min(window_y1, y);
-    window_x2 = max(window_x2, x + w - 1);
-    window_y2 = max(window_y2, y + h - 1);
-
-    int16_t x2 = x + w - 1;
-    int16_t y2 = y + h - 1;
-    if (x2 < 0 || x >= WIDTH || y2 < 0 || y >= HEIGHT) return;
-
-    for (int16_t jy = 0; jy < h; jy++) {
-        int16_t py = y + jy;
-        if (py < 0 || py >= HEIGHT) continue;
-
-        for (int16_t ix = 0; ix < w; ix += 2) {  // Process 2 pixels per byte
-            uint16_t byteIndex = (jy * w + ix) / 2;
-            uint8_t data = bitmap[byteIndex];
-
-            uint8_t pixel1 = (data >> 4) & 0x0F;
-            uint8_t pixel2 = data & 0x0F;
-
-            int16_t px1 = x + ix;
-            int16_t px2 = x + ix + 1;
-
-            if (px1 >= 0 && px1 < WIDTH) {
-                drawPixel(px1, py, pixel1);
-            }
-            if (ix + 1 < w && px2 >= 0 && px2 < WIDTH) {
-                drawPixel(px2, py, pixel2);
-            }
-        }
-    }
+    drawBitmap4bpp(x, y, bitmap, w, h, false);
 }

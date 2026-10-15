@@ -18,12 +18,14 @@ Please support Adafruit and open-source hardware by purchasing products from [Ad
 
 - 256×64 pixel SSD1322-based grayscale OLED support with 16 levels of grayscale
 - Optimized for Raspberry Pi Pico / Pico 2 with non-blocking DMA SPI transfers
-- Double buffering for tear-free updates
-- Dirty rectangle optimization to reduce data transfer
+- Double buffering for tear-free updates: draw the next frame while this one is still going out
+- Dirty rectangle optimization — only the changed region is addressed and sent
+- A full-width update goes as **one** DMA transfer, not one per row
+- Byte-aligned 4bpp bitmap blitting: a full-panel bitmap lands in 0.12 ms instead of 9.8 ms
 - Completion callback for asynchronous SPI updates
 - Full graphics support via Adafruit_GFX (text, shapes, rotation)
 - Custom 4-bit grayscale bitmap drawing (PROGMEM and RAM versions)
-- I2C and SPI interface support (SPI strongly recommended)
+- I2C and software SPI supported too, with a blocking transfer (hardware SPI strongly recommended)
 
 ## Why DMA?
 
@@ -138,10 +140,16 @@ void setup() {
 ```
 ### Key Methods
 
-display() – Starts non-blocking DMA transfer (SPI) or blocking update (I2C)
-displayBlocking() – Waits until update completes
+display() – Starts a non-blocking DMA transfer (hardware SPI), or sends and returns (I2C, software SPI)
 
-isTransferComplete() – Returns true when DMA transfer is finished
+displayAsync() – The same, but returns `true` if a transfer started or finished. `false` means
+there was nothing to send, a transfer is still running, or no DMA channel was free
+
+displayBlocking() – Waits until the update completes
+
+isTransferComplete() – Returns true when the transfer is finished. **Poll this.** A region
+narrower than the full panel is sent a row at a time, and the rows only advance when something
+calls this — so call it from your main loop, or use `displayBlocking()`
 
 setDisplayCompleteCallback(callback) – Execute function when update completes
 
@@ -229,16 +237,24 @@ void setup() {
 
 void loop() {
   static int frame = 0;
-  // Update display non-blocking
+
+  // Rows only advance when something polls, so poll every time round the loop.
+  if (!display.isTransferComplete()) {
+    // Do other work here while the frame goes out - read sensors, handle inputs.
+    return;
+  }
+
+  // The previous frame has landed, so it is safe to draw and send the next one.
   display.fillCircle(128, 32, 20 + (frame % 20), frame % 16);
   display.display();  // Returns immediately
-
-  // Do other work while display updates
-  // e.g., read sensors, handle inputs, etc.
 
   frame++;
 }
 ```
+
+Whatever you draw builds on what is already on the panel, so you only need to redraw what
+changed — clear the old position of a moving sprite and draw the new one, and the rest of the
+screen stays as it was. The library keeps the two buffers in step for you.
 ### Drawing a PROGMEM Bitmap
 
 ```cpp
@@ -257,10 +273,20 @@ Compilation errors on non-Pico boards → This library is intentionally Pico-spe
 
 ### Limitations
 
-Requires Arduino-Pico core for full functionality
-~16 KB SRAM needed for double buffer
+Requires Arduino-Pico core for the DMA path; I2C and software SPI fall back to a blocking send
+
+~16 KB SRAM needed for the double buffer
+
 Only 4-wire SPI and I2C tested
+
 SPI commands (not data) and all I2C operations are blocking
+
+A region narrower than the full panel is sent a row at a time and needs polling to advance; a
+full-width region goes as a single transfer
+
+Do not mix other SPI devices on the same bus with a transfer in flight — the async path holds CS
+low across the whole update
+
 Long-term OLED use may cause pixel dimming — call displayOff() when idle to extend life
 
 ### Contributing
