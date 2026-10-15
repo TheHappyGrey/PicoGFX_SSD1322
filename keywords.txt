@@ -3,3 +3,4 @@ PicoGFX_SSD1322	KEYWORD1
 display	KEYWORD2
 displayBlocking	KEYWORD2
 isTransferComplete	KEYWORD2
+displayAsync	KEYWORD2

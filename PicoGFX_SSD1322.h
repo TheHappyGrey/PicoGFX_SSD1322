@@ -38,6 +38,13 @@ You will find the original Library here https://github.com/adafruit/Adafruit_SSD
 
 #include <Adafruit_GrayOLED.h>
 
+/*! Library version as major * 10000 + minor * 100 + patch, so 1.1.0 is 10100.
+    A sketch that relies on something added in a particular version can check for it, which is
+    worth doing: 1.1.0 changed how the two buffers are kept in step, and a sketch that redraws
+    only part of the frame is silently wrong against an earlier copy rather than failing to
+    build. */
+#define PICOGFX_SSD1322_VERSION 10100
+
 #define SSD1322_BLACK 0x0
 #define SSD1322_WHITE 0xF
 #define SSD1322_I2C_ADDRESS 0x3D
@@ -88,7 +95,22 @@ public:
 
   bool begin(uint8_t i2caddr = SSD1322_I2C_ADDRESS, bool reset = true);
   void oled_data(uint8_t c);
-  void display();                   // Non-blocking (async for SPI)
+  /*!
+      @brief  Send everything drawn since the last update. Required by Adafruit_GrayOLED, so it
+              returns nothing; displayAsync() is the same call with its result.
+  */
+  void display();
+  /*!
+      @brief  Send everything drawn since the last update.
+      @return true if a transfer was started (hardware SPI) or finished (I2C, software SPI);
+              false if nothing had changed, or a previous transfer is still running, or no DMA
+              channel was free. A false return is not an error - usually it means the panel is
+              already up to date, or will be once the transfer in flight lands.
+      @note   On hardware SPI this returns as soon as the DMA is under way. A region narrower
+              than the full panel is sent a row at a time and only advances when something calls
+              isTransferComplete(), so poll that from your main loop - or use displayBlocking().
+  */
+  bool displayAsync();
   void displayBlocking();           // Blocking version (waits until complete)
   void invertDisplay(bool i);
   void displayOff();
@@ -106,7 +128,7 @@ public:
   void setDisplayCompleteCallback(DisplayCompleteCallback cb) { completeCallback = cb; }
 
 protected:
-  SPIClass *spi = nullptr; // Pointer to SPI interface
+  SPIClass *spi = nullptr; // Hardware SPI only; null for software SPI and I2C
   int8_t page_offset = 0;
   int8_t column_offset = 0;
   int16_t current_row;
@@ -123,6 +145,22 @@ protected:
   uint8_t* displayBuffer = nullptr; // Points to the buffer currently being sent/displayed
   int16_t transfer_byte_start;      // Starting byte offset for dirty region transfers
   uint8_t transfer_bytes_per_row;   // Bytes to transfer per row in dirty region
+  /*! Rows carried by one DMA transfer. Where the dirty region spans the full width the rows are
+      one unbroken run of bytes in the buffer, so the whole update goes as a single transfer
+      instead of one per row - 64 DMA set-ups become 1. Narrower regions still go a row at a
+      time, because their rows are not adjacent in memory. */
+  uint8_t transfer_rows_per_chunk;
+
+  /*! Address the controller's write window at the dirty region and open it for data. */
+  void openWindow(uint8_t column_start, uint8_t column_end, int16_t first_row, int16_t last_row);
+  /*! Blocking send, used for I2C and for software SPI (which has no DMA path). */
+  void sendBlocking(int16_t first_row, int16_t last_row);
+  /*! Copy the frame just sent into the buffer the caller draws next, so that drawing which does
+      not cover the whole dirty rectangle builds on what is actually on the panel. */
+  void syncDrawBuffer();
+  /*! Shared body of the two draw4bppBitmap() overloads. */
+  void drawBitmap4bpp(int16_t x, int16_t y, const uint8_t *bitmap, uint16_t w, uint16_t h,
+                      bool progmem);
 
   DisplayCompleteCallback completeCallback = nullptr;
 };
